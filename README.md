@@ -33,7 +33,7 @@ Install the required Python packages using the following pip command:
 
 ```bash
 pip install os shutil logging re unicodedata datetime unidecode requests json easyocr pillow numpy opencv-python
-    ```
+```
 ## Configuration
 
 Create a `tcg.cfg` file in the same directory as the script with the following content or use the defaults:
