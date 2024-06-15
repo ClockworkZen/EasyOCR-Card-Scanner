@@ -22,13 +22,15 @@ def read_config():
     config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tcg.cfg')
     if not os.path.exists(config_file):
         print("Configuration file 'tcg.cfg' not found.")
-        return None, None, 'WARNING', False, False, None
+        return None, None, None, 'WARNING', False, False, False, None
     
     mtg_folder = None
     pokemon_folder = None
+    lorcana_folder = None
     logging_level = 'WARNING'
     is_flipped_mtg = False
     is_flipped_pokemon = False
+    is_flipped_lorcana = False
     api_key = None
     
     with open(config_file, 'r') as file:
@@ -37,12 +39,16 @@ def read_config():
                 mtg_folder = line.split("=", 1)[1].strip()
             elif line.startswith("pokemon_folder="):
                 pokemon_folder = line.split("=", 1)[1].strip()
+            elif line.startswith("lorcana_folder="):
+                lorcana_folder = line.split("=", 1)[1].strip()
             elif line.startswith("logging_level="):
                 logging_level = line.split("=", 1)[1].strip().upper()
             elif line.startswith("is_flipped_mtg="):
                 is_flipped_mtg = line.split("=", 1)[1].strip().lower() == 'true'
             elif line.startswith("is_flipped_pokemon="):
                 is_flipped_pokemon = line.split("=", 1)[1].strip().lower() == 'true'
+            elif line.startswith("is_flipped_lorcana="):
+                is_flipped_lorcana = line.split("=", 1)[1].strip().lower() == 'true'
             elif line.startswith("api_key="):
                 api_key = line.split("=", 1)[1].strip()
     
@@ -52,9 +58,12 @@ def read_config():
     if pokemon_folder and not os.path.isabs(pokemon_folder):
         pokemon_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), pokemon_folder)
 
-    return mtg_folder, pokemon_folder, logging_level, is_flipped_mtg, is_flipped_pokemon, api_key
+    if lorcana_folder and not os.path.isabs(lorcana_folder):
+        lorcana_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), lorcana_folder)
 
-MTG_FOLDER, POKEMON_FOLDER, LOGGING_LEVEL, IS_FLIPPED_MTG, IS_FLIPPED_POKEMON, API_KEY = read_config()
+    return mtg_folder, pokemon_folder, lorcana_folder, logging_level, is_flipped_mtg, is_flipped_pokemon, is_flipped_lorcana, api_key
+
+MTG_FOLDER, POKEMON_FOLDER, LORCANA_FOLDER, LOGGING_LEVEL, IS_FLIPPED_MTG, IS_FLIPPED_POKEMON, IS_FLIPPED_LORCANA, API_KEY = read_config()
 
 log_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'log.txt')
 logging.basicConfig(level=getattr(logging, LOGGING_LEVEL, logging.WARNING), format='%(asctime)s %(levelname)s:%(message)s', handlers=[logging.FileHandler(log_file), logging.StreamHandler()])
@@ -76,6 +85,15 @@ def sanitize_filename(name):
     sanitized_name = re.sub(r'[^\w\s.-]', '', sanitized_name)
     sanitized_name = re.sub(r'\s+', ' ', sanitized_name).strip()
     return sanitized_name
+
+def sanitize_primary_name(name):
+    # Remove trailing numbers and spaces from the primary card name
+    name = re.sub(r'\d+$', '', name).strip()
+    return name
+
+def sanitize_combined_name(name):
+    # Remove trailing spaces
+    return name.strip()
 
 def process_mtg_image(image_path, output_path, save_debug=False):
     image = Image.open(image_path)
@@ -137,21 +155,58 @@ def process_pokemon_image(image_path, output_path, save_debug=False):
         top_20_percent_cropped_pil.save(debug_image_path)
         logging.debug(f"Saved debug image to {debug_image_path}")
 
-def get_card_name_and_set(image_path, process_image_function, api_url_template, headers=None):
+def process_lorcana_image(image_path, output_path, save_debug=False):
+    image = Image.open(image_path)
+    image = image.rotate(0 if IS_FLIPPED_LORCANA else 180)
+    
+    image_np = np.array(image)
+    gray = cv2.cvtColor(image_np, cv2.COLOR_BGR2GRAY)
+    _, thresh = cv2.threshold(gray, 210, 255, cv2.THRESH_BINARY_INV)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contour = max(contours, key=cv2.contourArea)
+    mask = np.zeros_like(gray)
+    cv2.drawContours(mask, [contour], -1, color=255, thickness=-1)
+    card = cv2.bitwise_and(image_np, image_np, mask=mask)
+    x, y, w, h = cv2.boundingRect(contour)
+    card_cropped = card[y:y+h, x:x+w]
+    cropped_image_pil = Image.fromarray(card_cropped)
+    
+    bottom_50_percent_height = int(0.5 * h)
+    bottom_50_percent_cropped = card_cropped[-bottom_50_percent_height:, :]
+    bottom_50_percent_cropped_pil = Image.fromarray(bottom_50_percent_cropped)
+    bottom_50_percent_cropped_pil.save(output_path)
+    
+    if save_debug and logging.getLogger().isEnabledFor(logging.DEBUG):
+        debug_image_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "OCR DEBUG.jpg")
+        count = 1
+        while os.path.exists(debug_image_path):
+            debug_image_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"OCR DEBUG_{count}.jpg")
+            count += 1
+        bottom_50_percent_cropped_pil.save(debug_image_path)
+        logging.debug(f"Saved debug image to {debug_image_path}")
+
+def get_card_name_and_set(image_path, process_image_function, api_url_template, fuzzy_search_function, headers=None):
     temp_image_path = os.path.join(os.path.dirname(image_path), 'temp_image.jpg')
     process_image_function(image_path, temp_image_path, save_debug=True)
     try:
         results = reader.readtext(temp_image_path, detail=0)
         os.remove(temp_image_path)
         if results:
-            first_line = results[0]
-            logging.debug(f"OCR detected text: {first_line}")
-            return first_line
+            primary_name = sanitize_primary_name(results[0])
+            if len(results) > 3 and results[1].isdigit() and results[2].isdigit():
+                secondary_name = results[3]
+                combined_name = f"{primary_name} - {secondary_name}".lower()
+            else:
+                combined_name = primary_name.lower()
+            combined_name = sanitize_combined_name(combined_name)
+            logging.debug(f"OCR detected text: {results}")
+            logging.debug(f"Combined name for API: {combined_name}")
+            return fuzzy_search_function(combined_name, image_path, api_url_template, headers)
         logging.debug("No text detected by OCR.")
-        return None
+        return None, None
     except Exception as e:
         log_error(f"Failed to process image {image_path}: {str(e)}")
-        return None
+        return None, None
 
 def fuzzy_search_card_name(card_name, image_path, api_url_template, headers=None):
     try:
@@ -161,12 +216,38 @@ def fuzzy_search_card_name(card_name, image_path, api_url_template, headers=None
             card_name = card_data['data'][0]['name']
             set_name = card_data['data'][0].get('set', {}).get('name', 'Unknown Set')
             logging.info(f"Identified card '{card_name}' from set '{set_name}' for image {os.path.relpath(image_path, start=MTG_FOLDER)}")
+            print(f"Card: '{card_name}' from Set: '{set_name}' was identified.")
             return card_name, set_name
         else:
             logging.warning(f"Card not found for text: {card_name} in image {os.path.relpath(image_path, start=MTG_FOLDER)}")
             return None, None
     except Exception as e:
         logging.error(f"Error processing image {os.path.relpath(image_path, start=MTG_FOLDER)}: {e}")
+        return None, None
+
+def fuzzy_search_card_name_lorcana(card_name, image_path, api_url_template, headers=None):
+    try:
+        response = requests.get(api_url_template.format(card_name))
+        response_json = response.json()
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            logging.debug(f"Lorcana API response: {response_json}")
+
+        if response.status_code == 200 and isinstance(response_json, list) and response_json:
+            card_data = response_json[0]
+            full_card_name = card_data.get('Name')
+            set_name = card_data.get('Set_Name', 'Unknown Set')
+            if full_card_name:
+                logging.info(f"Identified card '{full_card_name}' from set '{set_name}' for image {os.path.relpath(image_path, start=LORCANA_FOLDER)}")
+                print(f"Card: '{full_card_name}' from Set: '{set_name}' was identified.")
+                return full_card_name, set_name
+            else:
+                logging.warning(f"Card name field is empty in API response for text: {card_name} in image {os.path.relpath(image_path, start=LORCANA_FOLDER)}")
+                return None, None
+        else:
+            logging.warning(f"Card not found for text: {card_name} in image {os.path.relpath(image_path, start=LORCANA_FOLDER)}")
+            return None, None
+    except Exception as e:
+        logging.error(f"Error processing image {os.path.relpath(image_path, start=LORCANA_FOLDER)}: {e}")
         return None, None
 
 def move_file(src, dest_dir, new_name=None):
@@ -180,21 +261,29 @@ def move_file(src, dest_dir, new_name=None):
     shutil.move(src, new_path)
     return new_name
 
-def process_directory(import_directory, process_image_function, api_url_template, headers=None):
+def process_directory(import_directory, process_image_function, api_url_template, fuzzy_search_function, headers=None):
     total_files_processed = 0
     total_errors_encountered = 0
     error_files = []
     sets_without_process = []
+    notified = False
 
     for set_folder in os.listdir(import_directory):
         set_path = os.path.join(import_directory, set_folder)
         process_path = os.path.join(set_path, 'Process')
         
         if os.path.isdir(set_path):
+            if not notified:
+                print(f"Accessing {import_directory} directory.")
+                logging.info(f"Accessing {import_directory} directory.")
+                notified = True
+
             print(f"Scanning set directory: {set_folder}")
+            logging.info(f"Scanning set directory: {set_folder}")
             if not os.path.exists(process_path):
                 sets_without_process.append(set_folder)
                 print(f"No new files were found in {set_folder}/Process")
+                logging.info(f"No new files were found in {set_folder}/Process")
                 continue
 
             found_files = False
@@ -204,28 +293,27 @@ def process_directory(import_directory, process_image_function, api_url_template
                         found_files = True
                         total_files_processed += 1
                         file_path = os.path.join(root, file)
-                        card_name = get_card_name_and_set(file_path, process_image_function, api_url_template, headers)
+                        card_name, set_name = get_card_name_and_set(file_path, process_image_function, api_url_template, fuzzy_search_function, headers)
 
-                        if card_name:
-                            card_name, set_name = fuzzy_search_card_name(card_name, file_path, api_url_template, headers)
-                            if card_name and set_name:
-                                new_name = f"{sanitize_filename(card_name)} - {sanitize_filename(set_name)}{os.path.splitext(file)[1]}"
-                                new_name = move_file(file_path, set_path, new_name)
-                                relative_root = os.path.relpath(root, start=import_directory)
-                                print(f"Renamed '{file}' to '{new_name}' in {relative_root}")
-                                logging.info(f"Renamed '{file}' to '{new_name}' in {relative_root}")
-                            else:
-                                total_errors_encountered += 1
-                                error_files.append(file_path)
-                                log_error(f"Failed to identify card for '{os.path.relpath(file_path, start=import_directory)}'")
+                        if card_name and set_name:
+                            new_name = f"{sanitize_filename(card_name)}{os.path.splitext(file)[1]}"
+                            new_name = move_file(file_path, set_path, new_name)
+                            relative_root = os.path.relpath(root, start=import_directory)
+                            print(f"Renamed '{file}' to '{new_name}' in {relative_root}")
+                            logging.info(f"Renamed '{file}' to '{new_name}' in {relative_root}")
                         else:
                             total_errors_encountered += 1
                             error_files.append(file_path)
-                            log_error(f"Failed OCR recognition for '{os.path.relpath(file_path, start=import_directory)}'")
+                            log_error(f"Failed to identify card for '{os.path.relpath(file_path, start=import_directory)}'")
+                    else:
+                        total_errors_encountered += 1
+                        error_files.append(file_path)
+                        log_error(f"Failed OCR recognition for '{os.path.relpath(file_path, start=import_directory)}'")
 
             if not found_files:
                 sets_without_process.append(set_folder)
                 print(f"No new files were found in {set_folder}/Process")
+                logging.info(f"No new files were found in {set_folder}/Process")
 
     if total_files_processed == 0:
         print("No new files found.")
@@ -248,6 +336,8 @@ def process_directory(import_directory, process_image_function, api_url_template
                 error_checker_mtg(error_files, process_image_function, api_url_template, headers)
             elif process_image_function == process_pokemon_image:
                 error_checker_pokemon(error_files, process_image_function, api_url_template, headers)
+            elif process_image_function == process_lorcana_image:
+                error_checker_lorcana(error_files, process_image_function, api_url_template, headers)
     else:
         print("Error-checker will be skipped.")
         logging.info("Error-checker will be skipped.")
@@ -360,13 +450,75 @@ def error_checker_pokemon(error_files, process_image_function, api_url_template,
         print("No more errors!")
         logging.info("No more errors!")
 
+def error_checker_lorcana(error_files, process_image_function, api_url_template, headers=None):
+    print("Starting Lorcana error checker...")
+    logging.info("Starting Lorcana error checker...")
+
+    resolved_errors = 0
+    
+    for file_path in error_files:
+        set_folder = os.path.basename(os.path.dirname(os.path.dirname(file_path)))
+        set_dir = os.path.join(LORCANA_FOLDER, set_folder)
+        error_dir = os.path.join(set_dir, "Errors")
+        
+        try:
+            image = Image.open(file_path)
+            image = image.rotate(0 if IS_FLIPPED_LORCANA else 180)
+            
+            preprocessed_image = preprocess_image(image)
+            results = reader.readtext(np.array(preprocessed_image), detail=0)
+            if results:
+                primary_name = sanitize_primary_name(results[0])
+                if len(results) > 3 and results[1].isdigit() and results[2].isdigit():
+                    secondary_name = results[3]
+                    combined_name = f"{primary_name} - {secondary_name}".lower()
+                else:
+                    combined_name = primary_name.lower()
+                combined_name = sanitize_combined_name(combined_name)
+                logging.debug(f"Error checker OCR detected text: {results}")
+                card_name, set_name = fuzzy_search_card_name_lorcana(combined_name, file_path, api_url_template)
+                if card_name and set_name:
+                    new_name = f"{sanitize_filename(card_name)}{os.path.splitext(os.path.basename(file_path))[1]}"
+                    move_file(file_path, set_dir, new_name)
+                    relative_file_path = os.path.relpath(file_path, start=LORCANA_FOLDER)
+                    relative_new_path = os.path.relpath(os.path.join(set_dir, new_name), start=LORCANA_FOLDER)
+                    print(f"Renamed '{relative_file_path}' to '{relative_new_path}' in error checker")
+                    logging.info(f"Renamed '{relative_file_path}' to '{relative_new_path}' in error checker")
+                    resolved_errors += 1
+                else:
+                    move_file(file_path, error_dir)
+                    log_error(f"Failed to identify card for '{os.path.relpath(file_path, start=LORCANA_FOLDER)}' in error checker")
+            else:
+                move_file(file_path, error_dir)
+                log_error(f"Error checker failed OCR recognition for '{os.path.relpath(file_path, start=LORCANA_FOLDER)}'")
+        except Exception as e:
+            move_file(file_path, error_dir)
+            log_error(f"Error checker failed to process image {os.path.relpath(file_path, start=LORCANA_FOLDER)}: {str(e)}")
+
+    remaining_errors = len(error_files) - resolved_errors
+    if remaining_errors > 0:
+        print(f"Errors were found that could not be automatically resolved. Please check the quality and rotation of the images and try again.")
+        logging.info(f"Errors were found that could not be automatically resolved. Please check the quality and rotation of the images and try again.")
+        print(f"Erroring files have been moved to: {os.path.abspath(error_dir)}")
+        logging.info(f"Erroring files have been moved to: {os.path.abspath(error_dir)}")
+    else:
+        print("No more errors!")
+        logging.info("No more errors!")
+
 if __name__ == "__main__":
     mtg_processed = False
     pokemon_processed = False
+    lorcana_processed = False
+
+    logging.info(f"MTG_FOLDER: {MTG_FOLDER}")
+    logging.info(f"POKEMON_FOLDER: {POKEMON_FOLDER}")
+    logging.info(f"LORCANA_FOLDER: {LORCANA_FOLDER}")
 
     if MTG_FOLDER:
         if os.path.exists(MTG_FOLDER):
-            process_directory(MTG_FOLDER, process_mtg_image, 'https://api.scryfall.com/cards/named?fuzzy={}')
+            print("Accessing Magic the Gathering folder.")
+            logging.info("Accessing Magic the Gathering folder.")
+            process_directory(MTG_FOLDER, process_mtg_image, 'https://api.scryfall.com/cards/named?fuzzy={}', fuzzy_search_card_name)
             mtg_processed = True
         else:
             print("No folder found for Magic the Gathering.")
@@ -374,14 +526,27 @@ if __name__ == "__main__":
     
     if POKEMON_FOLDER:
         if os.path.exists(POKEMON_FOLDER):
-            process_directory(POKEMON_FOLDER, process_pokemon_image, 'https://api.pokemontcg.io/v2/cards?q=name:{}', headers={'X-Api-Key': API_KEY})
+            print("Accessing Pokemon folder.")
+            logging.info("Accessing Pokemon folder.")
+            process_directory(POKEMON_FOLDER, process_pokemon_image, 'https://api.pokemontcg.io/v2/cards?q=name:{}', fuzzy_search_card_name, headers={'X-Api-Key': API_KEY})
             pokemon_processed = True
         else:
             print("No folder found for Pokemon.")
             logging.warning("No folder found for Pokemon.")
     
-    if not mtg_processed and not pokemon_processed:
+    if LORCANA_FOLDER:
+        if os.path.exists(LORCANA_FOLDER):
+            print("Accessing Lorcana folder.")
+            logging.info("Accessing Lorcana folder.")
+            process_directory(LORCANA_FOLDER, process_lorcana_image, 'https://api.lorcana-api.com/cards/fetch?search%3Dname~{}', fuzzy_search_card_name_lorcana)
+            lorcana_processed = True
+        else:
+            print("No folder found for Lorcana.")
+            logging.warning("No folder found for Lorcana.")
+    
+    if not mtg_processed and not pokemon_processed and not lorcana_processed:
         print("No folders found for processing.")
+        logging.info("No folders found for processing.")
     
     logging.info("Processing complete. Press Enter to exit.")
     input("Processing complete. Press Enter to exit.")
