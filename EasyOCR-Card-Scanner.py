@@ -22,10 +22,11 @@ def read_config():
     config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tcg.cfg')
     if not os.path.exists(config_file):
         print("Configuration file 'tcg.cfg' not found.")
-        return None, 'WARNING'
+        return None, 'WARNING', False
     
     mtg_folder = None
     logging_level = 'WARNING'
+    is_flipped = False
     
     with open(config_file, 'r') as file:
         for line in file:
@@ -33,13 +34,15 @@ def read_config():
                 mtg_folder = line.split("=", 1)[1].strip()
             elif line.startswith("logging_level="):
                 logging_level = line.split("=", 1)[1].strip().upper()
+            elif line.startswith("is_flipped="):
+                is_flipped = line.split("=", 1)[1].strip().lower() == 'true'
     
     if mtg_folder and not os.path.isabs(mtg_folder):
         mtg_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), mtg_folder)
 
-    return mtg_folder, logging_level
+    return mtg_folder, logging_level, is_flipped
 
-MTG_FOLDER, LOGGING_LEVEL = read_config()
+MTG_FOLDER, LOGGING_LEVEL, IS_FLIPPED = read_config()
 
 log_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'log.txt')
 logging.basicConfig(level=getattr(logging, LOGGING_LEVEL, logging.WARNING), format='%(asctime)s %(levelname)s:%(message)s', handlers=[logging.FileHandler(log_file), logging.StreamHandler()])
@@ -64,7 +67,7 @@ def sanitize_filename(name):
 
 def process_image(image_path, output_path, save_debug=False):
     image = Image.open(image_path)
-    image = image.rotate(180)
+    image = image.rotate(0 if IS_FLIPPED else 180)
     
     image_np = np.array(image)
     gray = cv2.cvtColor(image_np, cv2.COLOR_BGR2GRAY)
@@ -139,33 +142,55 @@ def process_directory(import_directory):
     total_files_processed = 0
     total_errors_encountered = 0
     error_files = []
-    
-    for root, dirs, files in os.walk(import_directory):
-        for file in files:
-            if file.lower().endswith(('.jpg', '.jpeg', '.png')):
-                total_files_processed += 1
-                file_path = os.path.join(root, file)
-                card_name = get_card_name_and_set(file_path)
-                
-                if card_name:
-                    card_name, set_name = fuzzy_search_card_name(card_name, file_path)
-                    if card_name and set_name:
-                        new_name = f"{sanitize_filename(card_name)} - {sanitize_filename(set_name)}{os.path.splitext(file)[1]}"
-                        new_name = move_file(file_path, root, new_name)
-                        relative_root = os.path.relpath(root, start=MTG_FOLDER)
-                        print(f"Renamed '{file}' to '{new_name}' in {relative_root}")
-                        logging.info(f"Renamed '{file}' to '{new_name}' in {relative_root}")
-                    else:
-                        total_errors_encountered += 1
-                        error_files.append(file_path)
-                        log_error(f"Failed to identify card for '{os.path.relpath(file_path, start=MTG_FOLDER)}'")
-                else:
-                    total_errors_encountered += 1
-                    error_files.append(file_path)
-                    log_error(f"Failed OCR recognition for '{os.path.relpath(file_path, start=MTG_FOLDER)}'")
+    sets_without_process = []
 
-    print(f"\nTotal files processed: {total_files_processed}")
-    logging.info(f"Total files processed: {total_files_processed}")
+    for set_folder in os.listdir(import_directory):
+        set_path = os.path.join(import_directory, set_folder)
+        process_path = os.path.join(set_path, 'Process')
+        
+        if os.path.isdir(set_path):
+            print(f"Scanning set directory: {set_folder}")
+            if not os.path.exists(process_path):
+                sets_without_process.append(set_folder)
+                print(f"No new files were found in {set_folder}/Process")
+                continue
+
+            found_files = False
+            for root, dirs, files in os.walk(process_path):
+                for file in files:
+                    if file.lower().endswith(('.jpg', '.jpeg', '.png')):
+                        found_files = True
+                        total_files_processed += 1
+                        file_path = os.path.join(root, file)
+                        card_name = get_card_name_and_set(file_path)
+
+                        if card_name:
+                            card_name, set_name = fuzzy_search_card_name(card_name, file_path)
+                            if card_name and set_name:
+                                new_name = f"{sanitize_filename(card_name)} - {sanitize_filename(set_name)}{os.path.splitext(file)[1]}"
+                                new_name = move_file(file_path, set_path, new_name)
+                                relative_root = os.path.relpath(root, start=MTG_FOLDER)
+                                print(f"Renamed '{file}' to '{new_name}' in {relative_root}")
+                                logging.info(f"Renamed '{file}' to '{new_name}' in {relative_root}")
+                            else:
+                                total_errors_encountered += 1
+                                error_files.append(file_path)
+                                log_error(f"Failed to identify card for '{os.path.relpath(file_path, start=MTG_FOLDER)}'")
+                        else:
+                            total_errors_encountered += 1
+                            error_files.append(file_path)
+                            log_error(f"Failed OCR recognition for '{os.path.relpath(file_path, start=MTG_FOLDER)}'")
+
+            if not found_files:
+                sets_without_process.append(set_folder)
+                print(f"No new files were found in {set_folder}/Process")
+
+    if total_files_processed == 0:
+        print("No new files found.")
+        logging.info("No new files found.")
+    else:
+        print(f"\nTotal files processed: {total_files_processed}")
+        logging.info(f"Total files processed: {total_files_processed}")
     
     if total_errors_encountered > 0:
         print(f"Total errors encountered: {total_errors_encountered}")
@@ -196,13 +221,16 @@ def error_checker(error_files):
     print("Starting error checker...")
     logging.info("Starting error checker...")
 
-    error_dir = os.path.join(MTG_FOLDER, "Errors")
     resolved_errors = 0
     
     for file_path in error_files:
+        set_folder = os.path.basename(os.path.dirname(os.path.dirname(file_path)))
+        set_dir = os.path.join(MTG_FOLDER, set_folder)
+        error_dir = os.path.join(set_dir, "Errors")
+        
         try:
             image = Image.open(file_path)
-            image = image.rotate(180)
+            image = image.rotate(0 if IS_FLIPPED else 180)
             
             preprocessed_image = preprocess_image(image)
             results = reader.readtext(np.array(preprocessed_image), detail=0)
@@ -212,9 +240,9 @@ def error_checker(error_files):
                 card_name, set_name = fuzzy_search_card_name(first_line, file_path)
                 if card_name and set_name:
                     new_name = f"{sanitize_filename(card_name)} - {sanitize_filename(set_name)}{os.path.splitext(os.path.basename(file_path))[1]}"
-                    move_file(file_path, os.path.dirname(file_path), new_name)
+                    move_file(file_path, set_dir, new_name)
                     relative_file_path = os.path.relpath(file_path, start=MTG_FOLDER)
-                    relative_new_path = os.path.relpath(os.path.join(os.path.dirname(file_path), new_name), start=MTG_FOLDER)
+                    relative_new_path = os.path.relpath(os.path.join(set_dir, new_name), start=MTG_FOLDER)
                     print(f"Renamed '{relative_file_path}' to '{relative_new_path}' in error checker")
                     logging.info(f"Renamed '{relative_file_path}' to '{relative_new_path}' in error checker")
                     resolved_errors += 1
@@ -237,8 +265,6 @@ def error_checker(error_files):
     else:
         print("No more errors!")
         logging.info("No more errors!")
-    
-    input("Press Enter to exit.")
 
 if __name__ == "__main__":
     if not MTG_FOLDER or not os.path.exists(MTG_FOLDER):
