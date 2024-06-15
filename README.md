@@ -38,11 +38,11 @@ pip install os shutil logging re unicodedata datetime unidecode requests json ea
 
 Create a `tcg.cfg` file in the same directory as the script with the following content or use the defaults:
 
-    ```
+```
 mtg_folder=Magic the Gathering
 logging_level=DEBUG
 is_flipped=False
-    ```
+```
 
 - `mtg_folder`: The directory where your Magic: The Gathering card images are stored. This folder should contain subdirectories for each card set.
 - `logging_level`: The logging level (e.g., DEBUG, INFO, WARNING).
