@@ -71,7 +71,7 @@ logging.basicConfig(level=getattr(logging, LOGGING_LEVEL, logging.WARNING), form
 logger = logging.getLogger()
 logger.addFilter(ExcludeTagsFilter())
 
-reader = easyocr.Reader(['en'], gpu=False)
+reader = easyocr.Reader(['en'], gpu=True)
 
 def log_error(message):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -192,13 +192,14 @@ def get_card_name_and_set(image_path, process_image_function, api_url_template, 
         results = reader.readtext(temp_image_path, detail=0)
         os.remove(temp_image_path)
         if results:
-            primary_name = sanitize_primary_name(results[0])
-            if len(results) > 3 and results[1].isdigit() and results[2].isdigit():
-                secondary_name = results[3]
-                combined_name = f"{primary_name} - {secondary_name}".lower()
-            else:
-                combined_name = primary_name.lower()
-            combined_name = sanitize_combined_name(combined_name)
+            card_name = None
+            for i in range(len(results)):
+                if not re.match(r'^stage\s*\d*$', results[i].lower()):
+                    card_name = sanitize_primary_name(results[i])
+                    break
+            if not card_name:
+                card_name = sanitize_primary_name(results[0])
+            combined_name = sanitize_combined_name(card_name.lower())
             logging.debug(f"OCR detected text: {results}")
             logging.debug(f"Combined name for API: {combined_name}")
             return fuzzy_search_function(combined_name, image_path, api_url_template, headers)
@@ -213,8 +214,9 @@ def fuzzy_search_card_name(card_name, image_path, api_url_template, headers=None
         response = requests.get(api_url_template.format(card_name), headers=headers)
         if response.status_code == 200:
             card_data = response.json()
-            card_name = card_data['data'][0]['name']
-            set_name = card_data['data'][0].get('set', {}).get('name', 'Unknown Set')
+            logging.debug(f"API response: {str(card_data).encode('utf-8', errors='ignore').decode('utf-8')}")
+            card_name = card_data['name']
+            set_name = card_data.get('set_name', 'Unknown Set')
             logging.info(f"Identified card '{card_name}' from set '{set_name}' for image {os.path.relpath(image_path, start=MTG_FOLDER)}")
             print(f"Card: '{card_name}' from Set: '{set_name}' was identified.")
             return card_name, set_name
@@ -225,12 +227,29 @@ def fuzzy_search_card_name(card_name, image_path, api_url_template, headers=None
         logging.error(f"Error processing image {os.path.relpath(image_path, start=MTG_FOLDER)}: {e}")
         return None, None
 
+def fuzzy_search_card_name_pokemon(card_name, image_path, api_url_template, headers=None):
+    try:
+        response = requests.get(api_url_template.format(card_name), headers=headers)
+        if response.status_code == 200:
+            card_data = response.json()
+            logging.debug(f"API response: {str(card_data).encode('utf-8', errors='ignore').decode('utf-8')}")
+            card_name = card_data['data'][0]['name']
+            set_name = card_data['data'][0].get('set', {}).get('name', 'Unknown Set')
+            logging.info(f"Identified card '{card_name}' from set '{set_name}' for image {os.path.relpath(image_path, start=POKEMON_FOLDER)}")
+            print(f"Card: '{card_name}' from Set: '{set_name}' was identified.")
+            return card_name, set_name
+        else:
+            logging.warning(f"Card not found for text: {card_name} in image {os.path.relpath(image_path, start=POKEMON_FOLDER)}")
+            return None, None
+    except Exception as e:
+        logging.error(f"Error processing image {os.path.relpath(image_path, start=POKEMON_FOLDER)}: {e}")
+        return None, None
+
 def fuzzy_search_card_name_lorcana(card_name, image_path, api_url_template, headers=None):
     try:
         response = requests.get(api_url_template.format(card_name))
         response_json = response.json()
-        if logging.getLogger().isEnabledFor(logging.DEBUG):
-            logging.debug(f"Lorcana API response: {response_json}")
+        logging.debug(f"Lorcana API response: {str(response_json).encode('utf-8', errors='ignore').decode('utf-8')}")
 
         if response.status_code == 200 and isinstance(response_json, list) and response_json:
             card_data = response_json[0]
@@ -323,24 +342,11 @@ def process_directory(import_directory, process_image_function, api_url_template
         logging.info(f"Total files processed: {total_files_processed}")
     
     if total_errors_encountered > 0:
-        print(f"Total errors encountered: {total_errors_encountered}")
-        logging.info(f"Total errors encountered: {total_errors_encountered}")
-        print("Errors were found when trying to process one or more files. Press enter to run Error-checker or Q to quit.")
-        
-        user_input = input().strip().lower()
-        if user_input == "q":
-            print("Exiting.")
-            logging.info("User chose to quit. Exiting.")
-        else:
-            if process_image_function == process_mtg_image:
-                error_checker_mtg(error_files, process_image_function, api_url_template, headers)
-            elif process_image_function == process_pokemon_image:
-                error_checker_pokemon(error_files, process_image_function, api_url_template, headers)
-            elif process_image_function == process_lorcana_image:
-                error_checker_lorcana(error_files, process_image_function, api_url_template, headers)
+        return error_files
     else:
         print("Error-checker will be skipped.")
         logging.info("Error-checker will be skipped.")
+        return []
 
 def preprocess_image(image):
     # Convert image to grayscale
@@ -418,10 +424,16 @@ def error_checker_pokemon(error_files, process_image_function, api_url_template,
             
             preprocessed_image = preprocess_image(image)
             results = reader.readtext(np.array(preprocessed_image), detail=0)
+            card_name = None
             if results:
-                first_line = results[0]
-                logging.debug(f"Error checker OCR detected text: {first_line}")
-                card_name, set_name = fuzzy_search_card_name(first_line, file_path, api_url_template, headers)
+                for i in range(len(results)):
+                    if not re.match(r'^stage\s*\d*$', results[i].lower()):
+                        card_name = sanitize_primary_name(results[i])
+                        break
+                if not card_name:
+                    card_name = sanitize_primary_name(results[0])
+                logging.debug(f"Error checker OCR detected text: {results}")
+                card_name, set_name = fuzzy_search_card_name_pokemon(card_name, file_path, api_url_template, headers)
                 if card_name and set_name:
                     new_name = f"{sanitize_filename(card_name)} - {sanitize_filename(set_name)}{os.path.splitext(os.path.basename(file_path))[1]}"
                     move_file(file_path, set_dir, new_name)
@@ -514,11 +526,15 @@ if __name__ == "__main__":
     logging.info(f"POKEMON_FOLDER: {POKEMON_FOLDER}")
     logging.info(f"LORCANA_FOLDER: {LORCANA_FOLDER}")
 
+    mtg_errors = []
+    pokemon_errors = []
+    lorcana_errors = []
+
     if MTG_FOLDER:
         if os.path.exists(MTG_FOLDER):
             print("Accessing Magic the Gathering folder.")
             logging.info("Accessing Magic the Gathering folder.")
-            process_directory(MTG_FOLDER, process_mtg_image, 'https://api.scryfall.com/cards/named?fuzzy={}', fuzzy_search_card_name)
+            mtg_errors = process_directory(MTG_FOLDER, process_mtg_image, 'https://api.scryfall.com/cards/named?fuzzy={}', fuzzy_search_card_name)
             mtg_processed = True
         else:
             print("No folder found for Magic the Gathering.")
@@ -528,7 +544,7 @@ if __name__ == "__main__":
         if os.path.exists(POKEMON_FOLDER):
             print("Accessing Pokemon folder.")
             logging.info("Accessing Pokemon folder.")
-            process_directory(POKEMON_FOLDER, process_pokemon_image, 'https://api.pokemontcg.io/v2/cards?q=name:{}', fuzzy_search_card_name, headers={'X-Api-Key': API_KEY})
+            pokemon_errors = process_directory(POKEMON_FOLDER, process_pokemon_image, 'https://api.pokemontcg.io/v2/cards?q=name:{}', fuzzy_search_card_name_pokemon, headers={'X-Api-Key': API_KEY})
             pokemon_processed = True
         else:
             print("No folder found for Pokemon.")
@@ -538,7 +554,7 @@ if __name__ == "__main__":
         if os.path.exists(LORCANA_FOLDER):
             print("Accessing Lorcana folder.")
             logging.info("Accessing Lorcana folder.")
-            process_directory(LORCANA_FOLDER, process_lorcana_image, 'https://api.lorcana-api.com/cards/fetch?search%3Dname~{}', fuzzy_search_card_name_lorcana)
+            lorcana_errors = process_directory(LORCANA_FOLDER, process_lorcana_image, 'https://api.lorcana-api.com/cards/fetch?search%3Dname~{}', fuzzy_search_card_name_lorcana)
             lorcana_processed = True
         else:
             print("No folder found for Lorcana.")
@@ -548,5 +564,23 @@ if __name__ == "__main__":
         print("No folders found for processing.")
         logging.info("No folders found for processing.")
     
+    all_errors = mtg_errors + pokemon_errors + lorcana_errors
+    if all_errors:
+        print(f"Total errors encountered: {len(all_errors)}")
+        logging.info(f"Total errors encountered: {len(all_errors)}")
+        print("Errors were found when trying to process one or more files. Press enter to run Error-checker or Q to quit.")
+        
+        user_input = input().strip().lower()
+        if user_input == "q":
+            print("Exiting.")
+            logging.info("User chose to quit. Exiting.")
+        else:
+            error_checker_mtg(mtg_errors, process_mtg_image, 'https://api.scryfall.com/cards/named?fuzzy={}', headers=None)
+            error_checker_pokemon(pokemon_errors, process_pokemon_image, 'https://api.pokemontcg.io/v2/cards?q=name:{}', headers={'X-Api-Key': API_KEY})
+            error_checker_lorcana(lorcana_errors, process_lorcana_image, 'https://api.lorcana-api.com/cards/fetch?search%3Dname~{}', headers=None)
+    else:
+        print("No errors to check.")
+        logging.info("No errors to check.")
+
     logging.info("Processing complete. Press Enter to exit.")
     input("Processing complete. Press Enter to exit.")
