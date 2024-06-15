@@ -1,80 +1,93 @@
 # EasyOCR Card Scanner
 
-EasyOCR Card Scanner is a Python script designed to scan images of Magic: The Gathering cards and automatically recognize and organize them into directories based on their sets. It uses the EasyOCR library for Optical Character Recognition (OCR) and the Scryfall API for card identification.
+## Overview
+
+The EasyOCR Card Scanner script processes images of trading cards, identifies the cards using OCR and the Scryfall API, and sorts them into organized folders. This script is designed to work specifically with Magic: The Gathering cards but can be adapted for other trading card games.
 
 ## Features
 
-- Scans images of Magic: The Gathering cards
-- Uses EasyOCR for text recognition
-- Identifies cards using the Scryfall API
-- Handles errors and provides an error checker to resolve OCR issues
-- Logs processing details and errors
+- Scans images of trading cards and identifies them using EasyOCR and the Scryfall API.
+- Renames and organizes card images into set folders.
+- Handles errors by moving unrecognized images to an "Errors" folder within each set folder.
+- Option to run an error checker to attempt to identify and correct unrecognized images.
 
 ## Requirements
 
-- Python 3.7+
-- The following Python libraries:
-  - `os`
-  - `shutil`
-  - `logging`
-  - `re`
-  - `unicodedata`
-  - `datetime`
-  - `unidecode`
-  - `requests`
-  - `json`
-  - `easyocr`
-  - `Pillow`
-  - `numpy`
-  - `opencv-python`
+- Python 3.x
+- Required Python packages:
+  - os
+  - shutil
+  - logging
+  - re
+  - unicodedata
+  - datetime
+  - unidecode
+  - requests
+  - json
+  - easyocr
+  - Pillow
+  - numpy
+  - opencv-python
 
-## Setup
+Install the required Python packages using the following pip command:
 
-1. Download the script.
+```bash
+pip install os shutil logging re unicodedata datetime unidecode requests json easyocr pillow numpy opencv-python
+    ```
+## Configuration
 
-2. Install the required Python libraries:
-    ```sh
-    pip install os shutil logging re unicodedata datetime unidecode requests json easyocr Pillow numpy opencv-python
+Create a `tcg.cfg` file in the same directory as the script with the following content or use the defaults:
+
+    ```
+mtg_folder=Magic the Gathering
+logging_level=DEBUG
+is_flipped=False
     ```
 
-3. Create a `tcg.cfg` file in the root directory of the project with the following content:
-    ```plaintext
-    mtg_folder=Magic the Gathering
-    logging_level=WARNING
-    ```
+- `mtg_folder`: The directory where your Magic: The Gathering card images are stored. This folder should contain subdirectories for each card set.
+- `logging_level`: The logging level (e.g., DEBUG, INFO, WARNING).
+- `is_flipped`: Set to `True` if your card images appear flipped, otherwise set to `False`.
 
-    - `mtg_folder`: The path to the directory containing your Magic: The Gathering card images, preferably sorted by set. This can be a relative path.
-    - `logging_level`: The logging level (e.g., `DEBUG`, `INFO`, `WARNING`, `ERROR`).
+## Folder Structure
 
-4. Ensure the `mtg_folder` exists and contains subfolders representing card sets with card images.
+The script expects the following folder structure:
+```
+Script Directory
+└── Magic the Gathering
+├── Set Folder 1
+│ └── Process
+├── Set Folder 2
+│ └── Process
+└── Set Folder 3
+└── Process
+```
+
+- Place the card images you want to process in the `Process` folder of the respective set folder.
 
 ## Usage
 
-Run the script:
+1. Ensure the folder structure is correct and the card images are placed in the appropriate `Process` folders.
+2. Run the script:
+
 `python easyocr_card_scanner.py`
 
-the script will:
 
-1. Start by scanning the images in the specified `mtg_folder`.
-2. Attempt to recognize and identify each card.
-3. Rename and organize the cards into directories based on their existing folder structure.
-4. Log the processing details and any errors encountered.
-5. If errors are encountered, it will prompt you to run the error checker or quit.
-6. The error checker will attempt to resolve OCR issues and move unresolved erroring files to an `Errors` directory.
+3. The script will scan the `Process` folders, identify and rename the card images, and move them to the set folder.
+4. If any errors occur, the script will move the unrecognized images to an `Errors` folder within the respective set folder.
+5. If the card images appear flipped or OCR always fails, set `is_flipped=True` in the `tcg.cfg` file to correct the orientation.
 
 ## Error Handling
 
-- If OCR fails during the initial processing, the script logs the errors and prompts the user to run the error checker.
-- The error checker preprocesses images to improve OCR accuracy and attempts to resolve errors.
-- Unresolved errors are moved to an `Errors` directory for manual review.
+If errors occur, the script will:
+- Log the errors in `log.txt`.
+- Move the unrecognized images to an `Errors` folder within the respective set folder.
+- Prompt you to run the error checker to attempt to identify and correct unrecognized images.
+
+After running the error checker, any remaining errors will be logged and the unrecognized images will remain in the `Errors` folder for further review.
 
 ## License
 
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
-
-## Contributing
-
-Contributions are welcome! Please open an issue or submit a pull request with your changes.
+This project is licensed under the MIT License.
 
 ## Acknowledgements
 
