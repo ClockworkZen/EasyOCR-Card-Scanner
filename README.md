@@ -27,6 +27,7 @@ The tool uses a configuration file `tcg.cfg` to set up directories and options. 
 - **pokemon_api_key**: API key for accessing the Pokemon TCG API.
 - **openai_api_key**: API key for accessing the OpenAI API for critical error scanning.
 - **CleanUpMode**: Set to `true` to enable cleanup of empty error directories; otherwise, `false`. Default is `true`.
+- **NoPrompt**: Set to `true` to automatically run the critical error scanner instead of prompting for user input; otherwise, `false`. Default is `false`.
 
 ## Directory Structure
 The expected directory structure for the card images is as follows:
