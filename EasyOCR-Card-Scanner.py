@@ -23,7 +23,7 @@ def read_config():
     config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tcg.cfg')
     if not os.path.exists(config_file):
         print("Configuration file 'tcg.cfg' not found.")
-        return None, None, None, 'WARNING', False, False, False, None, None, True
+        return None, None, None, 'WARNING', False, False, False, None, None, True, False
     
     mtg_folder = None
     pokemon_folder = None
@@ -35,6 +35,7 @@ def read_config():
     pokemon_api_key = None
     openai_api_key = None
     cleanup_mode = True
+    no_prompt = False
     
     with open(config_file, 'r') as file:
         for line in file:
@@ -58,6 +59,8 @@ def read_config():
                 openai_api_key = line.split("=", 1)[1].strip()
             elif line.startswith("CleanUpMode="):
                 cleanup_mode = line.split("=", 1)[1].strip().lower() == 'true'
+            elif line.startswith("NoPrompt="):
+                no_prompt = line.split("=", 1)[1].strip().lower() == 'true'
     
     if mtg_folder and not os.path.isabs(mtg_folder):
         mtg_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), mtg_folder)
@@ -68,22 +71,20 @@ def read_config():
     if lorcana_folder and not os.path.isabs(lorcana_folder):
         lorcana_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), lorcana_folder)
 
-    return mtg_folder, pokemon_folder, lorcana_folder, logging_level, is_flipped_mtg, is_flipped_pokemon, is_flipped_lorcana, pokemon_api_key, openai_api_key, cleanup_mode
+    return mtg_folder, pokemon_folder, lorcana_folder, logging_level, is_flipped_mtg, is_flipped_pokemon, is_flipped_lorcana, pokemon_api_key, openai_api_key, cleanup_mode, no_prompt
 
-MTG_FOLDER, POKEMON_FOLDER, LORCANA_FOLDER, LOGGING_LEVEL, IS_FLIPPED_MTG, IS_FLIPPED_POKEMON, IS_FLIPPED_LORCANA, POKEMON_API_KEY, OPENAI_API_KEY, CLEAN_UP_MODE = read_config()
+MTG_FOLDER, POKEMON_FOLDER, LORCANA_FOLDER, LOGGING_LEVEL, IS_FLIPPED_MTG, IS_FLIPPED_POKEMON, IS_FLIPPED_LORCANA, POKEMON_API_KEY, OPENAI_API_KEY, CLEAN_UP_MODE, NO_PROMPT = read_config()
 
 log_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'log.txt')
 
 for handler in logging.root.handlers[:]:
     logging.root.removeHandler(handler)
 
-
 logging.basicConfig(level=getattr(logging, LOGGING_LEVEL, logging.WARNING), format='%(asctime)s %(levelname)s:%(message)s', handlers=[logging.FileHandler(log_file), logging.StreamHandler()])
 
 logger = logging.getLogger('CardScanner')
 logger.setLevel(getattr(logging, LOGGING_LEVEL, logging.WARNING))
 logger.addFilter(ExcludeTagsFilter())
-
 
 if not logger.hasHandlers():
     fh = logging.FileHandler(log_file)
@@ -667,17 +668,22 @@ if __name__ == "__main__":
     total_critical_errors = critical_errors_mtg + critical_errors_pokemon + critical_errors_lorcana
 
     if total_critical_errors > 0:
-        print(f"{total_critical_errors} number of critical errors remain unresolved. Press Enter to run critical error scanning using OpenAI or Q to quit.")
-        logger.info(f"{total_critical_errors} number of critical errors remain unresolved. Press Enter to run critical error scanning using OpenAI or Q to quit.")
-        
-        user_input = input().strip().lower()
-        if user_input == "q":
-            print("Exiting.")
-            logger.info("User chose to quit. Exiting.")
-        else:
+        if NO_PROMPT:
             critical_error_processor(MTG_FOLDER)
             critical_error_processor(POKEMON_FOLDER)
             critical_error_processor(LORCANA_FOLDER)
+        else:
+            print(f"{total_critical_errors} number of critical errors remain unresolved. Press Enter to run critical error scanning using OpenAI or Q to quit.")
+            logger.info(f"{total_critical_errors} number of critical errors remain unresolved. Press Enter to run critical error scanning using OpenAI or Q to quit.")
+            
+            user_input = input().strip().lower()
+            if user_input == "q":
+                print("Exiting.")
+                logger.info("User chose to quit. Exiting.")
+            else:
+                critical_error_processor(MTG_FOLDER)
+                critical_error_processor(POKEMON_FOLDER)
+                critical_error_processor(LORCANA_FOLDER)
     else:
         print("No Error files were detected.")
         logger.info("No Error files were detected.")
