@@ -28,6 +28,8 @@ The tool uses a configuration file `tcg.cfg` to set up directories and options. 
 - **openai_api_key**: API key for accessing the OpenAI API for critical error scanning.
 - **CleanUpMode**: Set to `true` to enable cleanup of empty error directories; otherwise, `false`. Default is `true`.
 - **NoPrompt**: Set to `true` to automatically run the critical error scanner instead of prompting for user input; otherwise, `false`. Default is `false`.
+- **preprocessor_enabled**: Se to `true` to enable the preprocessor. This will automatically rotate the image according to EXIF and crop the image if it's larger than the size threshold.
+-  **size_threshold**: Set to 2300 by default
 
 ## Directory Structure
 The expected directory structure for the card images is as follows:
