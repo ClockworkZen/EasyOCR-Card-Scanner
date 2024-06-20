@@ -1,3 +1,5 @@
+print("EasyOCR Card Scanner is starting up!")
+
 import os
 import shutil
 import logging
@@ -12,6 +14,8 @@ from PIL import Image, ImageEnhance, ImageFilter, ImageOps, ExifTags
 import numpy as np
 import cv2
 import base64
+import tempfile
+import sys
 
 class ExcludeTagsFilter(logging.Filter):
     def filter(self, record):
@@ -73,30 +77,80 @@ def read_config():
 
 mtg_folder, pokemon_folder, lorcana_folder, logging_level, is_flipped_mtg, is_flipped_pokemon, is_flipped_lorcana, pokemon_api_key, openai_api_key, cleanup_mode, no_prompt, preprocessor_enabled, size_threshold = read_config()
 
+# Configure logging
 log_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'log.txt')
 
-for handler in logging.root.handlers[:]:
-    logging.root.removeHandler(handler)
+# Create a handler for writing to the console with utf-8 encoding
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s:%(message)s'))
+console_handler.setStream(open(sys.stdout.fileno(), mode='w', encoding='utf-8', buffering=1))
 
-logging.basicConfig(level=getattr(logging, logging_level, logging.warning), format='%(asctime)s %(levelname)s:%(message)s', handlers=[logging.FileHandler(log_file), logging.StreamHandler()])
+# Create a handler for writing to the log file with utf-8 encoding
+file_handler = logging.FileHandler(log_file, encoding='utf-8')
+file_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s:%(message)s'))
+
+# Set the logging level based on the configuration file
+logging_level = getattr(logging, logging_level.upper(), logging.WARNING)
+
+# Set the level for the handlers
+console_handler.setLevel(logging_level)
+file_handler.setLevel(logging_level)
+
+# Set up logging with handlers
+logging.basicConfig(level=logging_level, handlers=[console_handler, file_handler])
 
 logger = logging.getLogger('CardScanner')
-logger.setLevel(getattr(logging, logging_level, logging.warning))
+logger.setLevel(logging_level)  # Set the logger to the configured level
 logger.addFilter(ExcludeTagsFilter())
-
-if not logger.hasHandlers():
-    fh = logging.FileHandler(log_file)
-    sh = logging.StreamHandler()
-    formatter = logging.Formatter('%(asctime)s %(levelname)s:%(message)s')
-    fh.setFormatter(formatter)
-    sh.setFormatter(formatter)
-    logger.addHandler(fh)
-    logger.addHandler(sh)
 
 reader = easyocr.Reader(['en'], gpu=True)
 
 def log_error(message):
     logger.error(message)
+
+def create_temp_dir(base_dir):
+    temp_dir = os.path.join(base_dir, "temp_processing")
+    if not os.path.exists(temp_dir):
+        os.makedirs(temp_dir)
+    return temp_dir
+
+def move_to_temp_dir(file_path, temp_dir):
+    temp_file_path = os.path.join(temp_dir, os.path.basename(file_path))
+    shutil.move(file_path, temp_file_path)
+    return temp_file_path
+
+def move_processed_file(source_path, dest_dir, new_name=None):
+    try:
+        if not os.path.isfile(source_path):
+            raise FileNotFoundError(f"The file {source_path} does not exist.")
+        
+        if not os.path.exists(dest_dir):
+            os.makedirs(dest_dir)
+
+        # Extract the original file extension
+        file_ext = os.path.splitext(source_path)[1]
+
+        # If a new name is provided, strip suffix and use it
+        base_name = strip_suffix(new_name) if new_name else os.path.splitext(os.path.basename(source_path))[0]
+
+        # Construct the new path
+        new_path = os.path.join(dest_dir, base_name + file_ext)
+        
+        # Check for duplicates and handle them
+        counter = 1
+        while os.path.isfile(new_path):
+            new_name_with_counter = f"{base_name}_{counter}"
+            new_path = os.path.join(dest_dir, new_name_with_counter + file_ext)
+            counter += 1
+        
+        # Move the file to the new path
+        shutil.move(source_path, new_path)
+        logging.info(f"File moved to {new_path}")
+        return new_path
+    
+    except Exception as e:
+        logging.error(f"Error moving file {source_path} to {new_path}: {str(e)}")
+        return None
 
 def sanitize_filename(name):
     name = name.replace('&', 'and')
@@ -106,28 +160,43 @@ def sanitize_filename(name):
     sanitized_name = re.sub(r'\s+', ' ', sanitized_name).strip()
     return sanitized_name
 
-def exif_rebalancer(image):
+def exif_rebalancer(image, image_path):
+    rotated = False
     try:
-        for orientation in ExifTags.tags.keys():
-            if ExifTags.tags[orientation] == 'Orientation':
+        orientation = None
+        for tag, value in ExifTags.TAGS.items():
+            if value == 'Orientation':
+                orientation = tag
                 break
 
         exif = image._getexif()
 
-        if exif is not None:
-            orientation = exif.get(orientation, None)
+        if exif is not None and orientation is not None:
+            orientation_value = exif.get(orientation, None)
 
-            if orientation == 3:
+            if orientation_value == 3:
                 image = image.rotate(180, expand=True)
-            elif orientation == 6:
+                logger.info(f"Invalid Orientation found, image rotated: {image_path}")
+                rotated = True
+            elif orientation_value == 6:
                 image = image.rotate(270, expand=True)
-            elif orientation == 8:
+                logger.info(f"Invalid Orientation found, image rotated: {image_path}")
+                rotated = True
+            elif orientation_value == 8:
                 image = image.rotate(90, expand=True)
-    except (AttributeError, KeyError, IndexError):
-        # cases: image don't have getexif
-        pass
+                logger.info(f"Invalid Orientation found, image rotated: {image_path}")
+                rotated = True
+            elif orientation_value == 1:
+                logger.info(f"Valid Orientation tag found, no rotation needed: {image_path}")
+            else:
+                logger.info(f"Unknown Orientation tag {orientation_value}, no rotation applied: {image_path}")
+        else:
+            logger.info(f"No Orientation tag, image not rotated: {image_path}")
 
-    return image
+    except (AttributeError, KeyError, IndexError) as e:
+        logger.error(f"EXIF read error for {image_path}: {str(e)}")
+
+    return image, rotated
 
 def frame_trimmer(image, crop_width, crop_height):
     img_width, img_height = image.size
@@ -140,13 +209,36 @@ def frame_trimmer(image, crop_width, crop_height):
 def preprocessor(image_path, size_threshold):
     try:
         image = Image.open(image_path)
-        image = exif_rebalancer(image)
+        original_image = image.copy()
+
+        # Track if any preprocessing was performed
+        preprocessing_performed = False
+
+        # Run exif rebalancer and check if rotation was performed
+        image, rotated = exif_rebalancer(image, image_path)
+        if rotated:
+            preprocessing_performed = True
 
         img_width, img_height = image.size
-        if img_width > size_threshold or img_height > size_threshold:
-            image = frame_trimmer(image, size_threshold, size_threshold)
 
-        image.save(image_path)
+        # Check if resizing is needed and log accordingly
+        if img_width > size_threshold or img_height > size_threshold:
+            logger.info(f"Resizing per Size Threshold: {image_path}")
+            image = frame_trimmer(image, size_threshold, size_threshold)
+            preprocessing_performed = True
+        else:
+            logger.info(f"No Resize needed: {image_path}")
+
+        logger.debug(f"Preprocessing performed: {preprocessing_performed} for {image_path}")
+
+        if preprocessing_performed:
+            image.save(image_path)
+            logger.info(f"Processing image file: {image_path}")
+        else:
+            # Conditional console logging for skipped preprocessing
+            message = f"{os.path.basename(image_path)} required no preprocessing, skipped."
+            logger.warning(message)
+            print(message)  # Ensuring this is executed
     except Exception as e:
         log_error(f"Error processing file {image_path}: {str(e)}")
 
@@ -183,7 +275,11 @@ def InvertWhiteText(image_path, threshold=220):
 
 def process_mtg_image(image_path, output_path, save_debug=False):
     image = Image.open(image_path)
-    image = image.rotate(0 if is_flipped_mtg else 180)
+    logger.debug(f"Original image mode: {image.mode}, size: {image.size}, path: {image_path}")
+
+    if is_flipped_mtg:
+       image = image.rotate(180, expand=True)
+       logger.debug(f"Image rotated 180 degrees for MTG: {image_path}")
 
     image_np = np.array(image)
     gray = cv2.cvtColor(image_np, cv2.COLOR_BGR2GRAY)
@@ -215,7 +311,11 @@ def process_mtg_image(image_path, output_path, save_debug=False):
 
 def process_pokemon_image(image_path, output_path, save_debug=False):
     image = Image.open(image_path)
-    image = image.rotate(0 if is_flipped_pokemon else 180)
+    logger.debug(f"Original image mode: {image.mode}, size: {image.size}, path: {image_path}")
+
+    if is_flipped_pokemon:
+        image = image.rotate(180, expand=True)
+        logger.debug(f"Image rotated 180 degrees for Pokemon: {image_path}")
 
     image_np = np.array(image)
     gray = cv2.cvtColor(image_np, cv2.COLOR_BGR2GRAY)
@@ -247,7 +347,11 @@ def process_pokemon_image(image_path, output_path, save_debug=False):
 
 def process_lorcana_image(image_path, output_path, save_debug=False):
     image = Image.open(image_path)
-    image = image.rotate(0 if is_flipped_lorcana else 180)
+    logger.debug(f"Original image mode: {image.mode}, size: {image.size}, path: {image_path}")
+
+    if is_flipped_lorcana:
+        image = image.rotate(180, expand=True)
+        logger.debug(f"Image rotated 180 degrees for Lorcana: {image_path}")
 
     image_np = np.array(image)
     gray = cv2.cvtColor(image_np, cv2.COLOR_BGR2GRAY)
@@ -277,8 +381,11 @@ def process_lorcana_image(image_path, output_path, save_debug=False):
 
     return bottom_55_percent_cropped_pil  # Return the cropped image for further processing
 
+
 def get_mtg_card_name_and_set(image_path, process_image_function, api_url_template, fuzzy_search_function, headers=None, set_folder=None):
-    temp_image_path = os.path.join(os.path.dirname(image_path), 'temp_image.jpg')
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as temp_image_file:
+        temp_image_path = temp_image_file.name
+
     cropped_image = process_image_function(image_path, temp_image_path, save_debug=True)
     try:
         # First OCR pass
@@ -290,9 +397,9 @@ def get_mtg_card_name_and_set(image_path, process_image_function, api_url_templa
                 card_name += ' ' + sanitize_primary_name(results[1])
             logger.debug(f"Using card name for api: {card_name}")
             card_name, set_name = fuzzy_search_function(card_name.lower(), image_path, api_url_template, headers)
-            if card_name and set_name:
+            if card_name:
                 os.remove(temp_image_path)
-                return card_name, set_name
+                return card_name  # Return only card_name
 
         # Second attempt with inverted white text
         inverted_image = InvertWhiteText(temp_image_path)
@@ -316,16 +423,20 @@ def get_mtg_card_name_and_set(image_path, process_image_function, api_url_templa
             if len(results) > 1:
                 card_name += ' ' + sanitize_primary_name(results[1])
             logger.debug(f"Using inverted card name for api: {card_name}")
-            return fuzzy_search_function(card_name.lower(), image_path, api_url_template, headers)
+            card_name, set_name = fuzzy_search_function(card_name.lower(), image_path, api_url_template, headers)
+            return card_name  # Return only card_name
 
         logger.debug("No valid text detected by OCR in both attempts.")
-        return None, None
+        return None
     except Exception as e:
         log_error(f"Failed to process image {image_path}: {str(e)}")
-        return None, None
+        return None
+
 
 def get_lorcana_card_name_and_set(image_path, process_image_function, api_url_template, fuzzy_search_function, headers=None, set_folder=None):
-    temp_image_path = os.path.join(os.path.dirname(image_path), 'temp_image.jpg')
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as temp_image_file:
+        temp_image_path = temp_image_file.name
+
     cropped_image = process_image_function(image_path, temp_image_path, save_debug=True)
     try:
         # First OCR pass
@@ -337,40 +448,46 @@ def get_lorcana_card_name_and_set(image_path, process_image_function, api_url_te
             combined_name = f"{primary_name} - {secondary_name}"
             combined_name = sanitize_combined_name(combined_name)
             logger.debug(f"Using combined card name for api: {combined_name}")
-            card_name, set_name = fuzzy_search_function(combined_name.lower(), image_path, api_url_template, headers)
-            if card_name and set_name:
+            card_name, _ = fuzzy_search_function(combined_name.lower(), image_path, api_url_template, headers)
+            if card_name:
                 os.remove(temp_image_path)
-                return card_name, set_name
+                return card_name
         else:
             logger.debug("Not enough text detected by OCR to form a valid card name.")
         os.remove(temp_image_path)
-        return None, None
+        return None
     except Exception as e:
         log_error(f"Failed to process image {image_path}: {str(e)}")
-        return None, None
+        return None
+
 
 def get_pokemon_card_name_and_set(image_path, process_image_function, api_url_template, fuzzy_search_function, headers=None, set_name=''):
-    temp_image_path = os.path.join(os.path.dirname(image_path), 'temp_image.jpg')
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as temp_image_file:
+        temp_image_path = temp_image_file.name
+
     cropped_image = process_image_function(image_path, temp_image_path, save_debug=True)
     temp_cropped_again_path = None
+    card_name = None
     try:
         # First OCR pass
         results = reader.readtext(temp_image_path, detail=0)
         logger.debug(f"OCR detected text: {results}")
 
-        card_name = None
-
         if results and len(results) > 1:
             second_line = results[1].lower()
 
             if second_line == "ancient":
-                # Skip the second line as it contains "Ancient"
+                # Skip the second line if it contains "Ancient"
                 card_name = sanitize_primary_name(results[0])
+            elif results[1].isupper() and len(results) > 2:
+                # Use the third entry as the primary name if the second line is in all caps
+                card_name = sanitize_primary_name(results[2])
             elif second_line in ["trainer", "energy", "traner"]:
                 # Crop the image to keep the bottom 65%
                 width, height = cropped_image.size
                 cropped_again = cropped_image.crop((0, int(height * 0.35), width, height))
-                temp_cropped_again_path = os.path.join(os.path.dirname(image_path), 'temp_cropped_again.jpg')
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as temp_cropped_again_file:
+                    temp_cropped_again_path = temp_cropped_again_file.name
                 cropped_again.save(temp_cropped_again_path)
 
                 # Re-OCR on cropped image
@@ -378,7 +495,7 @@ def get_pokemon_card_name_and_set(image_path, process_image_function, api_url_te
                 logger.debug(f"Re-OCR detected text: {results}")
 
                 if results and len(results) > 1:
-                    card_name = f"{sanitize_primary_name(results[0])} {sanitize_primary_name(results[1])}"
+                    card_name = sanitize_primary_name(results[0])
                 else:
                     card_name = sanitize_primary_name(results[0])
 
@@ -392,30 +509,59 @@ def get_pokemon_card_name_and_set(image_path, process_image_function, api_url_te
                     cropped_again.save(debug_image_path)
                     logger.debug(f"Saved cropped again debug image to {debug_image_path}")
             else:
-                card_name = sanitize_primary_name(results[1])  # Use only the second detected line if it's not "Ancient"
+                card_name = sanitize_primary_name(results[1])  # Use the second detected line if it's not "Ancient" or all caps
 
         if card_name:
-            # Strip 'ex' and 'ancient' from the card names if present
-            card_name = re.sub(r'ex\b', '', card_name, flags=re.IGNORECASE).strip()
-            card_name = re.sub(r'\bancient\b', '', card_name, flags=re.IGNORECASE).strip()
-            logger.debug(f"Using card name for api: {card_name}")
-            card_name, set_name = fuzzy_search_function(card_name.lower(), image_path, api_url_template, headers, set_name)
+            try:
+                # Strip 'ex' and 'ancient' from the card names if present
+                card_name = re.sub(r'ex\b', '', card_name, flags=re.IGNORECASE).strip()
+                card_name = re.sub(r'\bancient\b', '', card_name, flags=re.IGNORECASE).strip()
+                logger.debug(f"Using card name for api: {card_name}")
+                card_name, _ = fuzzy_search_function(card_name.lower(), image_path, api_url_template, headers, set_name)
 
-            if card_name and set_name:
-                os.remove(temp_image_path)
-                if temp_cropped_again_path and os.path.exists(temp_cropped_again_path):
-                    os.remove(temp_cropped_again_path)
-                return card_name, set_name
+                if card_name:
+                    os.remove(temp_image_path)
+                    if temp_cropped_again_path and os.path.exists(temp_cropped_again_path):
+                        os.remove(temp_cropped_again_path)
+                    return card_name
+            except Exception as e:
+                logger.debug(f"Exception during API request: {str(e)}")
+                # Continue to the next step instead of returning None
 
-        os.remove(temp_image_path)
+        # If the first pass or the API request fails, continue to the cropped again step
+        if temp_cropped_again_path and os.path.exists(temp_cropped_again_path):
+            results = reader.readtext(temp_cropped_again_path, detail=0)
+            logger.debug(f"Re-OCR detected text: {results}")
+
+            if results and len(results) > 1:
+                card_name = sanitize_primary_name(results[0])
+            else:
+                card_name = sanitize_primary_name(results[0])
+
+            if card_name:
+                try:
+                    # Strip 'ex' and 'ancient' from the card names if present
+                    card_name = re.sub(r'ex\b', '', card_name, flags=re.IGNORECASE).strip()
+                    card_name = re.sub(r'\bancient\b', '', card_name, flags=re.IGNORECASE).strip()
+                    logger.debug(f"Using card name for api: {card_name}")
+                    card_name, _ = fuzzy_search_function(card_name.lower(), image_path, api_url_template, headers, set_name)
+                except Exception as e:
+                    logger.debug(f"Exception during API request on cropped again: {str(e)}")
+
+                if card_name:
+                    os.remove(temp_image_path)
+                    if temp_cropped_again_path and os.path.exists(temp_cropped_again_path):
+                        os.remove(temp_cropped_again_path)
+                    return card_name
+
         if temp_cropped_again_path and os.path.exists(temp_cropped_again_path):
             os.remove(temp_cropped_again_path)
-        return None, None
+        return None
     except Exception as e:
         log_error(f"Failed to process image {image_path}: {str(e)}")
         if temp_cropped_again_path and os.path.exists(temp_cropped_again_path):
             os.remove(temp_cropped_again_path)
-        return None, None
+        return None
 
 def fuzzy_search_card_name(card_name, image_path, api_url_template, headers=None):
     try:
@@ -440,24 +586,24 @@ def fuzzy_search_card_name_pokemon(card_name, image_path, api_url_template, head
         response = requests.get(api_url_template.format(query), headers=headers)
         if response.status_code == 200:
             card_data = response.json()
-            logger.debug(f"api response: {str(card_data).encode('utf-8', errors='ignore').decode('utf-8')}")
+            logger.debug(f"API response: {str(card_data).encode('utf-8', errors='ignore').decode('utf-8')}")
             card_name = card_data['data'][0]['name']
             set_name = card_data['data'][0].get('set', {}).get('name', 'Unknown Set')
             logger.info(f"Identified card '{card_name}' from set '{set_name}' for image {os.path.relpath(image_path, start=pokemon_folder)}")
             print(f"Card: '{card_name}' from Set: '{set_name}' was identified.")
             return card_name, set_name
         else:
-            logger.debug(f"api request failed with status code {response.status_code} for card name: {card_name}")
+            logger.debug(f"API request failed with status code {response.status_code} for card name: {card_name}")
             return None, None
     except Exception as e:
-        logger.debug(f"Exception during api request: {str(e)}")
+        logger.debug(f"Exception during API request: {str(e)}")
         return None, None
 
 def fuzzy_search_card_name_lorcana(card_name, image_path, api_url_template, headers=None):
     try:
         response = requests.get(api_url_template.format(card_name))
         response_json = response.json()
-        logger.debug(f"Lorcana api response: {str(response_json).encode('utf-8', errors='ignore').decode('utf-8')}")
+        logger.debug(f"Lorcana API response: {str(response_json).encode('utf-8', errors='ignore').decode('utf-8')}")
 
         if response.status_code == 200 and isinstance(response_json, list) and response_json:
             card_data = response_json[0]
@@ -474,26 +620,46 @@ def fuzzy_search_card_name_lorcana(card_name, image_path, api_url_template, head
     except Exception as e:
         return None, None
 
-def move_file(src, dest_dir, new_name=None):
-    if not os.path.exists(dest_dir):
-        os.makedirs(dest_dir)
+def strip_suffix(file_name):
+    # Regex to find _1, _2, _3... at the end of the file name
+    return re.sub(r'(_\d+)+$', '', file_name)
 
-    if new_name is None:
-        new_name = os.path.basename(src)
+def move_file(source_path, dest_dir, new_name=None):
+    try:
+        if not os.path.isfile(source_path):
+            raise FileNotFoundError(f"The file {source_path} does not exist.")
+        
+        if not os.path.exists(dest_dir):
+            os.makedirs(dest_dir)
 
-    base_name, ext = os.path.splitext(new_name)
-    new_path = os.path.join(dest_dir, new_name)
-    counter = 1
+        # Extract the original file extension
+        file_ext = os.path.splitext(source_path)[1]
 
-    while os.path.exists(new_path):
-        new_name = f"{base_name}_{counter}{ext}"
-        new_path = os.path.join(dest_dir, new_name)
-        counter += 1
+        # If a new name is provided, strip suffix and use it
+        base_name = strip_suffix(new_name) if new_name else os.path.splitext(os.path.basename(source_path))[0]
 
-    shutil.move(src, new_path)
-    return new_name
+        # Construct the new path
+        new_path = os.path.join(dest_dir, base_name + file_ext)
+        
+        # Check for duplicates and handle them
+        counter = 1
+        while os.path.isfile(new_path):
+            new_name_with_counter = f"{base_name}_{counter}"
+            new_path = os.path.join(dest_dir, new_name_with_counter + file_ext)
+            counter += 1
+        
+        # Move the file to the new path
+        shutil.move(source_path, new_path)
+        logging.info(f"File moved to {new_path}")
+        return new_path
+    
+    except Exception as e:
+        logging.error(f"Error moving file {source_path} to {new_path}: {str(e)}")
+        return None
+
 
 def process_directory(import_directory, process_image_function, api_url_template, fuzzy_search_function, headers=None, card_type=''):
+    temp_dir = create_temp_dir(import_directory)
     total_files_processed = 0
     total_errors_encountered = 0
     error_files = []
@@ -537,23 +703,26 @@ def process_directory(import_directory, process_image_function, api_url_template
                         found_files = True
                         total_files_processed += 1
                         file_path = os.path.join(root, file)
-                        card_name, set_name = get_card_name_and_set_function(file_path, process_image_function, api_url_template, fuzzy_search_function, headers, set_folder)
+                        
+                        temp_file_path = move_to_temp_dir(file_path, temp_dir)
+                        
+                        card_name = get_card_name_and_set_function(temp_file_path, process_image_function, api_url_template, fuzzy_search_function, headers, set_folder)
 
-                        if card_name and set_name:
-                            new_name = f"{sanitize_filename(card_name)}{os.path.splitext(file)[1]}"
-                            move_file(file_path, set_path, new_name)
+                        if card_name:
+                            new_name = sanitize_filename(card_name)  # No need to add extension here
+                            move_processed_file(temp_file_path, set_path, new_name)
                             relative_root = os.path.relpath(root, start=import_directory)
-                            print(f"Renamed '{file}' to '{new_name}' in {relative_root}")
-                            logger.info(f"Renamed '{file}' to '{new_name}' in {relative_root}")
+                            print(f"Renamed '{file}' to '{new_name}{os.path.splitext(file)[1]}' in {relative_root}")
+                            logger.info(f"Renamed '{file}' to '{new_name}{os.path.splitext(file)[1]}' in {relative_root}")
                         else:
                             total_errors_encountered += 1
                             error_files.append(file_path)
-                            move_file(file_path, os.path.join(set_path, 'Errors'))
+                            move_processed_file(temp_file_path, os.path.join(set_path, 'Errors'))
                             log_error(f"Failed to identify card for '{os.path.relpath(file_path, start=import_directory)}'")
                     else:
                         total_errors_encountered += 1
                         error_files.append(file_path)
-                        move_file(file_path, os.path.join(set_path, 'Errors'))
+                        move_processed_file(file_path, os.path.join(set_path, 'Errors'))
                         log_error(f"Failed OCR recognition for '{os.path.relpath(file_path, start=import_directory)}'")
 
             if not found_files:
@@ -565,13 +734,13 @@ def process_directory(import_directory, process_image_function, api_url_template
         print("No new files found.")
         logger.info("No new files found.")
     else:
-        print(f"\nTotal files processed: {total_files_processed}")
-        logger.info(f"Total files processed: {total_files_processed}")
+        print(f"Files Processed: {total_files_processed}")
+        logger.info(f"Files Processed: {total_files_processed}")
 
-    if total_errors_encountered > 0:
-        return error_files
-    else:
-        return []
+    # Cleanup the temp directory after processing
+    shutil.rmtree(temp_dir)
+    
+    return error_files
 
 def preprocess_image(image):
     gray = image.convert('L')
@@ -596,11 +765,22 @@ def error_checker_mtg(error_files, process_image_function, api_url_template, hea
 
     for file_path in error_files:
         try:
-            # First Stage: Crop 50% from the top and perform OCR
             image = Image.open(file_path)
-            image = image.rotate(0 if is_flipped_mtg else 180)
+            logger.debug(f"Original image mode: {image.mode}, size: {image.size}, path: {file_path}")
+
+            # First Stage: Crop 50% from the top and perform OCR
             width, height = image.size
             cropped_image = image.crop((0, 0, width, height // 2))
+
+            # Save debug image
+            if logger.isEnabledFor(logging.DEBUG):
+                debug_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), "OCR Debug Images")
+                if not os.path.exists(debug_folder):
+                    os.makedirs(debug_folder)
+                original_name = os.path.splitext(os.path.basename(file_path))[0]
+                debug_image_path = os.path.join(debug_folder, f"{original_name}_OCR_debug_error_checker_stage1.jpg")
+                cropped_image.save(debug_image_path)
+                logger.debug(f"Saved debug image to {debug_image_path}")
 
             results = reader.readtext(np.array(cropped_image), detail=0)
             if results:
@@ -608,50 +788,57 @@ def error_checker_mtg(error_files, process_image_function, api_url_template, hea
                 if len(results) > 1:
                     card_name += ' ' + sanitize_primary_name(results[1])
                 logger.debug(f"First stage OCR detected text: {card_name}")
-                card_name, set_name = fuzzy_search_card_name(card_name, file_path, api_url_template, headers)
-                if card_name and set_name:
-                    new_name = f"{sanitize_filename(card_name)} - {sanitize_filename(set_name)}{os.path.splitext(os.path.basename(file_path))[1]}"
+                card_name, _ = fuzzy_search_card_name(card_name, file_path, api_url_template, headers)
+                if card_name:
+                    new_name = sanitize_filename(card_name)  # Only sanitize the card name
                     move_file(file_path, os.path.dirname(os.path.dirname(file_path)), new_name)
                     relative_file_path = os.path.relpath(file_path, start=mtg_folder)
-                    relative_new_path = os.path.relpath(os.path.join(os.path.dirname(os.path.dirname(file_path)), new_name), start=mtg_folder)
+                    relative_new_path = os.path.relpath(os.path.join(os.path.dirname(os.path.dirname(file_path)), new_name + os.path.splitext(file_path)[1]), start=mtg_folder)
                     print(f"Renamed '{relative_file_path}' to '{relative_new_path}' in error checker")
                     logger.info(f"Renamed '{relative_file_path}' to '{relative_new_path}' in error checker")
                     resolved_errors += 1
-                    continue  # Move to the next file if resolved
-                else:
-                    logger.debug(f"First stage verification failed for {file_path}")
+                    continue
 
             # Second Stage: Use the unedited image with preprocessing
             preprocessed_image = preprocess_image(image)
+
+            # Save debug image
+            if logger.isEnabledFor(logging.DEBUG):
+                debug_image_path = os.path.join(debug_folder, f"{original_name}_OCR_debug_error_checker_stage2.jpg")
+                preprocessed_image.save(debug_image_path)
+                logger.debug(f"Saved debug image to {debug_image_path}")
+
             results = reader.readtext(np.array(preprocessed_image), detail=0)
             if results:
                 card_name = sanitize_primary_name(results[0])
                 if len(results) > 1:
                     card_name += ' ' + sanitize_primary_name(results[1])
                 logger.debug(f"Second stage OCR detected text: {card_name}")
-                card_name, set_name = fuzzy_search_card_name(card_name, file_path, api_url_template, headers)
-                if card_name and set_name:
-                    new_name = f"{sanitize_filename(card_name)} - {sanitize_filename(set_name)}{os.path.splitext(os.path.basename(file_path))[1]}"
+                card_name, _ = fuzzy_search_card_name(card_name, file_path, api_url_template, headers)
+                if card_name:
+                    new_name = sanitize_filename(card_name)  # Only sanitize the card name
                     move_file(file_path, os.path.dirname(os.path.dirname(file_path)), new_name)
                     relative_file_path = os.path.relpath(file_path, start=mtg_folder)
-                    relative_new_path = os.path.relpath(os.path.join(os.path.dirname(os.path.dirname(file_path)), new_name), start=mtg_folder)
+                    relative_new_path = os.path.relpath(os.path.join(os.path.dirname(os.path.dirname(file_path)), new_name + os.path.splitext(file_path)[1]), start=mtg_folder)
                     print(f"Renamed '{relative_file_path}' to '{relative_new_path}' in error checker")
                     logger.info(f"Renamed '{relative_file_path}' to '{relative_new_path}' in error checker")
                     resolved_errors += 1
-                else:
-                    move_file(file_path, os.path.join(os.path.dirname(os.path.dirname(file_path)), 'Errors'))
-                    log_error(f"Failed to identify card for '{os.path.relpath(file_path, start=mtg_folder)}' in error checker")
-                    critical_errors += 1
-            else:
-                move_file(file_path, os.path.join(os.path.dirname(os.path.dirname(file_path)), 'Errors'))
-                log_error(f"Second stage OCR failed recognition for '{os.path.relpath(file_path, start=mtg_folder)}'")
-                critical_errors += 1
+                    continue
+
+            # If both OCR stages fail, mark as critical error
+            move_file(file_path, os.path.join(os.path.dirname(os.path.dirname(file_path)), 'Errors'))
+            log_error(f"Failed to identify card for '{os.path.relpath(file_path, start=mtg_folder)}' in error checker")
+            critical_errors += 1
         except Exception as e:
             move_file(file_path, os.path.join(os.path.dirname(os.path.dirname(file_path)), 'Errors'))
             log_error(f"Error checker failed to process image {os.path.relpath(file_path, start=mtg_folder)}: {str(e)}")
             critical_errors += 1
 
+    print(f"Remaining critical errors: {critical_errors}")
     return critical_errors
+
+
+
 
 def error_checker_pokemon(error_files, process_image_function, api_url_template, headers=None):
     resolved_errors = 0
@@ -659,36 +846,113 @@ def error_checker_pokemon(error_files, process_image_function, api_url_template,
 
     for file_path in error_files:
         try:
+            set_folder = os.path.basename(os.path.dirname(os.path.dirname(file_path)))
+
             image = Image.open(file_path)
-            image = image.rotate(0 if is_flipped_pokemon else 180)
+            logger.debug(f"Original image mode: {image.mode}, size: {image.size}, path: {file_path}")
+
+            width, height = image.size
+            cropped_image = image.crop((0, 0, width, height // 2))
+
+            if logger.isEnabledFor(logging.DEBUG):
+                debug_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), "OCR Debug Images")
+                if not os.path.exists(debug_folder):
+                    os.makedirs(debug_folder)
+                original_name = os.path.splitext(os.path.basename(file_path))[0]
+                debug_image_path = os.path.join(debug_folder, f"{original_name}_OCR_debug_error_checker_stage1.jpg")
+                cropped_image.save(debug_image_path)
+                logger.debug(f"Saved debug image to {debug_image_path}")
+
+            results = reader.readtext(np.array(cropped_image), detail=0)
+            logger.debug(f"Error checker OCR detected text: {results}")
+
+            card_name = None
+
+            if results and len(results) > 1:
+                first_line = results[0].lower()
+                second_line = results[1].lower()
+
+                if second_line == "ancient":
+                    card_name = sanitize_primary_name(results[0])
+                elif results[1].isupper() and len(results) > 2:
+                    card_name = sanitize_primary_name(results[2])
+                elif first_line in ["trainer", "energy", "traner"]:
+                    card_name = sanitize_primary_name(results[1])
+                else:
+                    card_name = sanitize_primary_name(results[1])
+
+            if card_name:
+                try:
+                    card_name = re.sub(r'ex\b', '', card_name, flags=re.IGNORECASE).strip()
+                    card_name = re.sub(r'\bancient\b', '', card_name, flags=re.IGNORECASE).strip()
+                    logger.debug(f"Using card name for api: {card_name}")
+                    card_name, _ = fuzzy_search_card_name_pokemon(card_name.lower(), file_path, api_url_template, headers, set_folder)
+
+                    if card_name:
+                        new_name = sanitize_filename(card_name)
+                        move_file(file_path, os.path.dirname(os.path.dirname(file_path)), new_name)
+                        relative_file_path = os.path.relpath(file_path, start=pokemon_folder)
+                        relative_new_path = os.path.relpath(os.path.join(os.path.dirname(os.path.dirname(file_path)), new_name + os.path.splitext(file_path)[1]), start=pokemon_folder)
+                        print(f"Renamed '{relative_file_path}' to '{relative_new_path}' in error checker")
+                        logger.info(f"Renamed '{relative_file_path}' to '{relative_new_path}' in error checker")
+                        resolved_errors += 1
+                        continue
+                except Exception as e:
+                    logger.debug(f"Exception during API request: {str(e)}")
+                    # If an exception occurs, proceed to the next OCR stage
 
             preprocessed_image = preprocess_image(image)
+
+            if logger.isEnabledFor(logging.DEBUG):
+                debug_image_path = os.path.join(debug_folder, f"{original_name}_OCR_debug_error_checker_stage2.jpg")
+                preprocessed_image.save(debug_image_path)
+                logger.debug(f"Saved debug image to {debug_image_path}")
+
             results = reader.readtext(np.array(preprocessed_image), detail=0)
+            logger.debug(f"Error checker OCR detected text: {results}")
+
             if results and len(results) > 1:
-                card_name = sanitize_primary_name(results[1])  # Use only the second detected line
-                logger.debug(f"Error checker OCR detected text: {card_name}")
-                card_name, set_name = fuzzy_search_card_name_pokemon(card_name.lower(), file_path, api_url_template, headers)
-                if card_name and set_name:
-                    new_name = f"{sanitize_filename(card_name)} - {sanitize_filename(set_name)}{os.path.splitext(os.path.basename(file_path))[1]}"
-                    move_file(file_path, os.path.dirname(os.path.dirname(file_path)), new_name)
-                    relative_file_path = os.path.relpath(file_path, start=pokemon_folder)
-                    relative_new_path = os.path.relpath(os.path.join(os.path.dirname(os.path.dirname(file_path)), new_name), start=pokemon_folder)
-                    print(f"Renamed '{relative_file_path}' to '{relative_new_path}' in error checker")
-                    logger.info(f"Renamed '{relative_file_path}' to '{relative_new_path}' in error checker")
-                    resolved_errors += 1
+                first_line = results[0].lower()
+                second_line = results[1].lower()
+
+                if second_line == "ancient":
+                    card_name = sanitize_primary_name(results[0])
+                elif results[1].isupper() and len(results) > 2:
+                    card_name = sanitize_primary_name(results[2])
+                elif first_line in ["trainer", "energy", "traner"]:
+                    card_name = sanitize_primary_name(results[1])
                 else:
-                    move_file(file_path, os.path.join(os.path.dirname(os.path.dirname(file_path)), 'Errors'))
-                    log_error(f"Failed to identify card for '{os.path.relpath(file_path, start=pokemon_folder)}' in error checker")
-                    critical_errors += 1
-            else:
-                move_file(file_path, os.path.join(os.path.dirname(os.path.dirname(file_path)), 'Errors'))
-                log_error(f"Error checker failed OCR recognition for '{os.path.relpath(file_path, start=pokemon_folder)}'")
-                critical_errors += 1
+                    card_name = sanitize_primary_name(results[1])
+
+            if card_name:
+                try:
+                    card_name = re.sub(r'ex\b', '', card_name, flags=re.IGNORECASE).strip()
+                    card_name = re.sub(r'\bancient\b', '', card_name, flags=re.IGNORECASE).strip()
+                    logger.debug(f"Using card name for api: {card_name}")
+                    card_name, _ = fuzzy_search_card_name_pokemon(card_name.lower(), file_path, api_url_template, headers, set_folder)
+
+                    if card_name:
+                        new_name = sanitize_filename(card_name)
+                        move_file(file_path, os.path.dirname(os.path.dirname(file_path)), new_name)
+                        relative_file_path = os.path.relpath(file_path, start=pokemon_folder)
+                        relative_new_path = os.path.relpath(os.path.join(os.path.dirname(os.path.dirname(file_path)), new_name + os.path.splitext(file_path)[1]), start=pokemon_folder)
+                        print(f"Renamed '{relative_file_path}' to '{relative_new_path}' in error checker")
+                        logger.info(f"Renamed '{relative_file_path}' to '{relative_new_path}' in error checker")
+                        resolved_errors += 1
+                        continue
+                except Exception as e:
+                    logger.debug(f"Exception during API request: {str(e)}")
+
+            move_file(file_path, os.path.join(os.path.dirname(os.path.dirname(file_path)), 'Errors'))
+            log_error(f"Failed to identify card for '{os.path.relpath(file_path, start=pokemon_folder)}' in error checker")
+            critical_errors += 1
         except Exception as e:
             move_file(file_path, os.path.join(os.path.dirname(os.path.dirname(file_path)), 'Errors'))
+            print(f"File '{os.path.basename(file_path)}' failed OCR detection.")
             log_error(f"Error checker failed to process image {os.path.relpath(file_path, start=pokemon_folder)}: {str(e)}")
             critical_errors += 1
 
+    print(f"\nRemaining critical errors: {critical_errors}")
     return critical_errors
 
 def error_checker_lorcana(error_files, process_image_function, api_url_template, headers=None):
@@ -698,42 +962,92 @@ def error_checker_lorcana(error_files, process_image_function, api_url_template,
     for file_path in error_files:
         try:
             image = Image.open(file_path)
-            image = image.rotate(0 if is_flipped_lorcana else 180)
+            logger.debug(f"Original image mode: {image.mode}, size: {image.size}, path: {file_path}")
+
+            width, height = image.size
+            cropped_image = image.crop((0, int(height * 0.45), width, height))
+
+            if logger.isEnabledFor(logging.DEBUG):
+                debug_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), "OCR Debug Images")
+                if not os.path.exists(debug_folder):
+                    os.makedirs(debug_folder)
+                original_name = os.path.splitext(os.path.basename(file_path))[0]
+                debug_image_path = os.path.join(debug_folder, f"{original_name}_OCR_debug_error_checker_stage1.jpg")
+                cropped_image.save(debug_image_path)
+                logger.debug(f"Saved debug image to {debug_image_path}")
+
+            results = reader.readtext(np.array(cropped_image), detail=0)
+            logger.debug(f"Error checker OCR detected text: {results}")
+
+            card_name = None
+
+            if results and len(results) >= 4:
+                primary_name = sanitize_primary_name(results[0])
+                secondary_name = sanitize_primary_name(results[3])
+                combined_name = f"{primary_name} - {secondary_name}"
+                combined_name = sanitize_combined_name(combined_name)
+                logger.debug(f"Using combined card name for API: {combined_name}")
+
+                try:
+                    card_name, _ = fuzzy_search_card_name_lorcana(combined_name.lower(), file_path, api_url_template)
+
+                    if card_name:
+                        new_name = sanitize_filename(card_name)
+                        move_file(file_path, os.path.dirname(os.path.dirname(file_path)), new_name)
+                        relative_file_path = os.path.relpath(file_path, start=lorcana_folder)
+                        relative_new_path = os.path.relpath(os.path.join(os.path.dirname(os.path.dirname(file_path)), new_name + os.path.splitext(file_path)[1]), start=lorcana_folder)
+                        print(f"Renamed '{relative_file_path}' to '{relative_new_path}' in error checker")
+                        logger.info(f"Renamed '{relative_file_path}' to '{relative_new_path}' in error checker")
+                        resolved_errors += 1
+                        continue
+                except Exception as e:
+                    logger.debug(f"Exception during API request: {str(e)}")
 
             preprocessed_image = preprocess_image(image)
+
+            if logger.isEnabledFor(logging.DEBUG):
+                debug_image_path = os.path.join(debug_folder, f"{original_name}_OCR_debug_error_checker_stage2.jpg")
+                preprocessed_image.save(debug_image_path)
+                logger.debug(f"Saved debug image to {debug_image_path}")
+
             results = reader.readtext(np.array(preprocessed_image), detail=0)
-            if results:
+            logger.debug(f"Error checker OCR detected text: {results}")
+
+            if results and len(results) >= 4:
                 primary_name = sanitize_primary_name(results[0])
-                if len(results) > 3 and results[1].isdigit() and results[2].isdigit():
-                    secondary_name = results[3]
-                    combined_name = f"{primary_name} - {secondary_name}".lower()
-                else:
-                    combined_name = primary_name.lower()
+                secondary_name = sanitize_primary_name(results[3])
+                combined_name = f"{primary_name} - {secondary_name}"
                 combined_name = sanitize_combined_name(combined_name)
-                logger.debug(f"Error checker OCR detected text: {results}")
-                card_name, set_name = fuzzy_search_card_name_lorcana(combined_name, file_path, api_url_template)
-                if card_name and set_name:
-                    new_name = f"{sanitize_filename(card_name)}{os.path.splitext(os.path.basename(file_path))[1]}"
-                    move_file(file_path, os.path.dirname(os.path.dirname(file_path)), new_name)
-                    relative_file_path = os.path.relpath(file_path, start=lorcana_folder)
-                    relative_new_path = os.path.relpath(os.path.join(os.path.dirname(os.path.dirname(file_path)), new_name), start=lorcana_folder)
-                    print(f"Renamed '{relative_file_path}' to '{relative_new_path}' in error checker")
-                    logger.info(f"Renamed '{relative_file_path}' to '{relative_new_path}' in error checker")
-                    resolved_errors += 1
-                else:
-                    move_file(file_path, os.path.join(os.path.dirname(os.path.dirname(file_path)), 'Errors'))
-                    log_error(f"Failed to identify card for '{os.path.relpath(file_path, start=lorcana_folder)}' in error checker")
-                    critical_errors += 1
-            else:
-                move_file(file_path, os.path.join(os.path.dirname(os.path.dirname(file_path)), 'Errors'))
-                log_error(f"Error checker failed OCR recognition for '{os.path.relpath(file_path, start=lorcana_folder)}'")
-                critical_errors += 1
+                logger.debug(f"Using combined card name for API: {combined_name}")
+
+                try:
+                    card_name, _ = fuzzy_search_card_name_lorcana(combined_name.lower(), file_path, api_url_template)
+
+                    if card_name:
+                        new_name = sanitize_filename(card_name)
+                        move_file(file_path, os.path.dirname(os.path.dirname(file_path)), new_name)
+                        relative_file_path = os.path.relpath(file_path, start=lorcana_folder)
+                        relative_new_path = os.path.relpath(os.path.join(os.path.dirname(os.path.dirname(file_path)), new_name + os.path.splitext(file_path)[1]), start=lorcana_folder)
+                        print(f"Renamed '{relative_file_path}' to '{relative_new_path}' in error checker")
+                        logger.info(f"Renamed '{relative_file_path}' to '{relative_new_path}' in error checker")
+                        resolved_errors += 1
+                        continue
+                except Exception as e:
+                    logger.debug(f"Exception during API request: {str(e)}")
+
+            move_file(file_path, os.path.join(os.path.dirname(os.path.dirname(file_path)), 'Errors'))
+            log_error(f"Failed to identify card for '{os.path.relpath(file_path, start=lorcana_folder)}' in error checker")
+            critical_errors += 1
         except Exception as e:
             move_file(file_path, os.path.join(os.path.dirname(os.path.dirname(file_path)), 'Errors'))
             log_error(f"Error checker failed to process image {os.path.relpath(file_path, start=lorcana_folder)}: {str(e)}")
             critical_errors += 1
 
+    print(f"\nRemaining critical errors: {critical_errors}")
     return critical_errors
+
+
+
 
 def find_error_files(base_folder):
     error_files_dict = {}
@@ -859,7 +1173,6 @@ def main():
                 if folder:
                     image_files = find_image_files(folder)
                     for file_path in image_files:
-                        print(f"Processing image file: {file_path}")
                         preprocessor(file_path, size_threshold)
             preprocessor_run = True
         else:
@@ -935,6 +1248,8 @@ def main():
     critical_errors_lorcana = sum(error_checker_lorcana(lorcana_error_files, process_lorcana_image, 'https://api.lorcana-api.com/cards/fetch?search%3Dname~{}', headers=None) for lorcana_error_files in lorcana_error_files_dict.values())
 
     total_critical_errors = critical_errors_mtg + critical_errors_pokemon + critical_errors_lorcana
+
+    print(f"\nTotal critical errors remaining after error checker: {total_critical_errors}")
 
     if total_critical_errors > 0:
         if no_prompt:
